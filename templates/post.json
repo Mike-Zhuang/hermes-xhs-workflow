@@ -14,5 +14,5 @@
   ],
   "topics": ["AI", "论文", "机器学习"],
   "visibility": "public",
-  "publish_mode": "manual"
+  "publish_mode": "immediate"
 }

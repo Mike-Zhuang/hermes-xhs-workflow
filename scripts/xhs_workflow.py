@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and verify immutable Xiaohongshu publication manifests."""
+"""Build and verify content-addressed Xiaohongshu publication manifests."""
 
 from __future__ import annotations
 
@@ -19,7 +19,11 @@ SCHEMA_VERSION = 1
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 MAX_JSON_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 32
-VERIFICATION_METHODS = {"official_creator_ui", "official_note_page"}
+VERIFICATION_METHODS = {
+    "creator_api_readback",
+    "official_creator_ui",
+    "official_note_page",
+}
 SECRET_FIELD_NAMES = {
     "authorization",
     "authorizationheader",
@@ -440,9 +444,15 @@ def approve_manifest(
     ttl_seconds: int = 1800,
     confirmed_by: str,
     confirmed_content_hash: str,
+    authorization_mode: str = "explicit_hash_confirmation",
 ) -> dict[str, Any]:
     if confirmed_by != "user":
         raise WorkflowError("confirmed_by must be 'user'")
+    if authorization_mode not in {
+        "direct_publish_command",
+        "explicit_hash_confirmation",
+    }:
+        raise WorkflowError("authorization_mode is unsupported")
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 86400:
         raise WorkflowError("ttl_seconds must be between 1 and 86400")
     report = validate_manifest(manifest_path)
@@ -459,6 +469,7 @@ def approve_manifest(
         "content_hash": manifest["content_hash"],
         "confirmed_content_hash": confirmed_content_hash,
         "confirmed_by": confirmed_by,
+        "authorization_mode": authorization_mode,
         "issued_at": _format_utc(issued_at),
         "expires_at": _format_utc(issued_at + timedelta(seconds=ttl_seconds)),
     }
@@ -507,6 +518,11 @@ def verify_approval(
         errors.append("approval confirmed_content_hash mismatch")
     if approval.get("confirmed_by") != "user":
         errors.append("approval is not user-confirmed")
+    if approval.get("authorization_mode") not in {
+        "direct_publish_command",
+        "explicit_hash_confirmation",
+    }:
+        errors.append("approval authorization_mode is unsupported")
 
     now = datetime.now(timezone.utc)
     try:
@@ -591,7 +607,8 @@ def record_publication(
     method = verification.get("method")
     if method not in VERIFICATION_METHODS:
         raise WorkflowError(
-            "verification method must be official_creator_ui or official_note_page"
+            "verification method must be creator_api_readback, "
+            "official_creator_ui, or official_note_page"
         )
     verified_by = verification.get("verified_by")
     if verified_by not in {"user", "agent"}:
@@ -631,10 +648,12 @@ def record_publication(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Prepare and verify human-approved Xiaohongshu publication packages."
+        description="Prepare and verify user-authorized Xiaohongshu publication packages."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    prepare = subparsers.add_parser("prepare", help="Create an immutable manifest")
+    prepare = subparsers.add_parser(
+        "prepare", help="Create a content-addressed manifest"
+    )
     prepare.add_argument("--source", required=True)
     prepare.add_argument("--manifest", required=True)
 
@@ -652,9 +671,14 @@ def _build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--ttl-seconds", type=int, default=1800)
     approve.add_argument("--confirmed-by", required=True, choices=["user"])
     approve.add_argument(
+        "--authorization-mode",
+        choices=["direct_publish_command", "explicit_hash_confirmation"],
+        default="explicit_hash_confirmation",
+    )
+    approve.add_argument(
         "--confirmed-content-hash",
         required=True,
-        help="Exact full content_hash explicitly confirmed by the user",
+        help="Exact full content_hash bound to the selected authorization mode",
     )
 
     verify = subparsers.add_parser("verify", help="Verify manifest-bound approval")
@@ -686,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
                 ttl_seconds=args.ttl_seconds,
                 confirmed_by=args.confirmed_by,
                 confirmed_content_hash=args.confirmed_content_hash,
+                authorization_mode=args.authorization_mode,
             )
         elif args.command == "verify":
             result = verify_approval(args.manifest, args.approval)

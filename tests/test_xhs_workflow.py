@@ -57,6 +57,38 @@ class XHSWorkflowTests(unittest.TestCase):
             self.assertTrue(report["valid"])
             self.assertEqual(report["content_hash"], manifest["content_hash"])
 
+    def test_direct_publish_command_is_recorded_as_authorization_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "01.png").write_bytes(PNG_HEADER + b"direct-command")
+            source = root / "post.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "title": "直接发布",
+                        "content": "TL;DR：用户指令本身构成一次授权。",
+                        "images": ["01.png"],
+                        "publish_mode": "immediate",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            manifest = root / "manifest.json"
+            approval = root / "approval.json"
+            prepared = prepare_manifest(source, manifest)
+
+            approved = approve_manifest(
+                manifest,
+                approval,
+                confirmed_by="user",
+                confirmed_content_hash=prepared["content_hash"],
+                authorization_mode="direct_publish_command",
+            )
+
+            self.assertEqual(approved["authorization_mode"], "direct_publish_command")
+            self.assertTrue(verify_approval(manifest, approval)["valid"])
+
     def test_malformed_manifest_reports_invalid_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = Path(tmp) / "manifest.json"

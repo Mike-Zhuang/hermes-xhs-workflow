@@ -22,6 +22,7 @@ class SkillStructureTests(unittest.TestCase):
 
         linked = [
             "scripts/xhs_workflow.py",
+            "scripts/xhs_publish_adapter.py",
             "scripts/xhs_readonly_adapter.py",
             "templates/post.json",
             "templates/readonly-request.json",
