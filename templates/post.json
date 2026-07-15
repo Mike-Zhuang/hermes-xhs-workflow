@@ -1,0 +1,18 @@
+{
+  "title": "示例标题",
+  "content": "TL;DR：这里填写将要发布的完整正文。",
+  "images": [
+    "01.png",
+    "02.png",
+    "03.png",
+    "04.png",
+    "05.png",
+    "06.png",
+    "07.png",
+    "08.png",
+    "09.png"
+  ],
+  "topics": ["AI", "论文", "机器学习"],
+  "visibility": "public",
+  "publish_mode": "manual"
+}

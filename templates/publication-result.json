@@ -1,0 +1,11 @@
+{
+  "platform": "xiaohongshu",
+  "note_id": "replace-with-real-note-id",
+  "url": "https://www.xiaohongshu.com/explore/replace-with-real-note-id",
+  "published_at": "2020-01-01T12:00:00Z",
+  "verification": {
+    "method": "official_note_page",
+    "verified_by": "user",
+    "verified_at": "2020-01-01T12:05:00Z"
+  }
+}

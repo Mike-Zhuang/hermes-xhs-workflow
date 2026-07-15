@@ -1,0 +1,11 @@
+{
+  "namespace": "pc",
+  "method": "search_note",
+  "params": {
+    "query": "AI 论文",
+    "page": 1,
+    "sort_type_choice": 0,
+    "note_type": 0,
+    "note_time": 0
+  }
+}

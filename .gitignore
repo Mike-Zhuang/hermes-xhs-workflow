@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.devtools/
+.env
+.env.*
+!.env.example
+
+# Never commit local credentials or browser/session state.
+*cookie*
+*cookies*
+*session*
+*token*
+*credential*
+browser-profile/
+
+# Working publication artifacts belong outside the Skill repository.
+manifest.json
+approval.json
+publication.json
+result.json
+output.json
+.local/
+.DS_Store
