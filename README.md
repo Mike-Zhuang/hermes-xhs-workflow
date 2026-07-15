@@ -4,7 +4,7 @@ A safety-gated Hermes Agent Skill for preparing and recording Xiaohongshu (XHS/�
 
 ## What it does
 
-- builds an immutable manifest from a title, body, topics, and 1–9 local images;
+- builds a content-addressed manifest from a title, body, topics, and 1–9 local images;
 - hashes every asset and the canonical publication payload;
 - renders the exact preview an agent must show before confirmation;
 - creates short-lived approval only when the caller supplies the exact content hash the user confirmed;

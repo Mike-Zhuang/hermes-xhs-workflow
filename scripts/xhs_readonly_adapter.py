@@ -103,7 +103,13 @@ def _load_object(path: Path, *, max_bytes: int = MAX_REQUEST_BYTES) -> dict[str,
         value = json.loads(path.read_text(encoding="utf-8"))
     except AdapterError:
         raise
-    except (OSError, json.JSONDecodeError, RecursionError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise AdapterError(f"Cannot read JSON file {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise AdapterError(f"Expected a JSON object in {path}")
@@ -158,8 +164,11 @@ def _read_cookie(path: Path) -> str:
         flags |= os.O_NOFOLLOW
     try:
         descriptor = os.open(path, flags)
-    except OSError as exc:
-        if exc.errno in {errno.ELOOP, errno.ENOENT}:
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError) or getattr(exc, "errno", None) in {
+            errno.ELOOP,
+            errno.ENOENT,
+        }:
             raise AdapterError(
                 "cookie file must be a regular, non-symlink file"
             ) from exc
@@ -272,7 +281,7 @@ def run_request(
     cookie = _read_cookie(Path(cookie_file))
     try:
         tool = Path(api_tool).resolve(strict=True)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise AdapterError(f"Cannot resolve XhsSkills api tool: {api_tool}") from exc
     if not tool.is_file():
         raise AdapterError("api tool must be a regular file")

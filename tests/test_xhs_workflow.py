@@ -79,6 +79,24 @@ class XHSWorkflowTests(unittest.TestCase):
             self.assertFalse(report["valid"])
             self.assertTrue(any("assets" in error for error in report["errors"]))
 
+            malformed = json.loads(manifest.read_text(encoding="utf-8"))
+            malformed["package_root"] = "bad\u0000root"
+            manifest.write_text(json.dumps(malformed), encoding="utf-8")
+            nul_report = validate_manifest(manifest)
+            self.assertFalse(nul_report["valid"])
+            self.assertTrue(
+                any(
+                    "package_root is invalid" in error for error in nul_report["errors"]
+                )
+            )
+
+            manifest.write_bytes(b"\xff\xfeinvalid-json")
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = main(["validate", "--manifest", str(manifest)])
+            self.assertEqual(exit_code, 2)
+            self.assertFalse(json.loads(output.getvalue())["ok"])
+
     def test_prepare_rejects_mislabeled_image_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -404,6 +422,26 @@ class XHSWorkflowTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "future"):
+                record_publication(
+                    manifest_path, approval_path, result_path, record_path
+                )
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "platform": "xiaohongshu",
+                        "note_id": "note-123",
+                        "url": "https://www.xiaohongshu.com/explore/note-123",
+                        "published_at": utc_minutes_ago(10),
+                        "verification": {
+                            "method": "official_note_page",
+                            "verified_by": "user",
+                            "verified_at": utc_minutes_ago(9),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "approval window"):
                 record_publication(
                     manifest_path, approval_path, result_path, record_path
                 )

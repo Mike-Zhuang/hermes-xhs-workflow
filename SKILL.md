@@ -1,6 +1,6 @@
 ---
 name: xhs-workflow
-description: Use when preparing, validating, confirming, publishing, or recording a Xiaohongshu (XHS/小红书) post from a local content package, or when performing tightly bounded read-only XHS research through an optional XhsSkills backend. Enforces immutable manifests, asset hashes, exact previews, explicit content-hash confirmation, expiring approvals, externally verified publication evidence, credential isolation, and a read-only API allowlist.
+description: Use when preparing, validating, confirming, publishing, or recording a Xiaohongshu (XHS/小红书) post from a local content package, or when performing tightly bounded read-only XHS research through an optional XhsSkills backend. Enforces content-addressed manifests, asset hashes, exact previews, explicit content-hash confirmation, expiring approvals, externally verified publication evidence, credential isolation, and a read-only API allowlist.
 version: 0.1.0
 author: Chengbo Zhuang and Hermes Agent
 license: MIT
@@ -19,12 +19,12 @@ Use this skill to turn a local sharing package into a controlled Xiaohongshu pub
 
 ```text
 post.json + 1–9 local images
-  -> immutable manifest and SHA-256 asset hashes
+  -> content-addressed manifest and SHA-256 asset hashes
   -> validation and exact preview
   -> explicit user confirmation
   -> short-lived manifest-bound approval
   -> official UI/manual publication
-  -> verified note URL and append-only publication record
+  -> verified note URL and non-overwriting publication record at the chosen path
 ```
 
 The included Python scripts use only the standard library. They do not log in, scrape, upload, or publish by themselves. `scripts/xhs_readonly_adapter.py` can optionally call a separately installed `cv-cat/XhsSkills` runtime, but only through a narrow read-only allowlist and a private temporary parameter file.
@@ -93,7 +93,7 @@ XHS_SKILL='<skill-dir>'
 PACKAGE='/absolute/path/to/share-package'
 ```
 
-### 1. Prepare the immutable manifest
+### 1. Prepare the content-addressed manifest
 
 ```bash
 python3 "$XHS_SKILL/scripts/xhs_workflow.py" prepare \

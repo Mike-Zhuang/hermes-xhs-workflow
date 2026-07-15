@@ -198,6 +198,17 @@ Path(a.out).write_text(json.dumps({'namespace': a.namespace, 'method': a.method,
                     request, api_tool=root / "unused.py", cookie_file=cookie_link
                 )
 
+    def test_rejects_invalid_utf8_request_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            request = root / "request.json"
+            request.write_bytes(b"\xff\xfeinvalid-json")
+            cookie = root / "cookie.txt"
+            cookie.write_text("synthetic", encoding="utf-8")
+            os.chmod(cookie, 0o600)
+            with self.assertRaisesRegex(AdapterError, "Cannot read JSON"):
+                run_request(request, api_tool=root / "unused.py", cookie_file=cookie)
+
     def test_rejects_cookie_file_readable_by_group_or_others(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

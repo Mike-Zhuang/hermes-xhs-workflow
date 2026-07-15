@@ -127,7 +127,13 @@ def _load_json(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except WorkflowError:
         raise
-    except (OSError, json.JSONDecodeError, RecursionError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise WorkflowError(f"Cannot read JSON file {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise WorkflowError(f"Expected a JSON object in {path}")
@@ -170,6 +176,8 @@ def _validate_image_signature(name: str, suffix: str, header: bytes) -> None:
 
 
 def _inspect_asset(package_root: Path, raw_path: str) -> tuple[Path, str, int]:
+    if "\x00" in raw_path:
+        raise WorkflowError("Image path contains a NUL byte")
     relative = Path(raw_path)
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
         raise WorkflowError(f"Image escapes the package directory: {raw_path}")
@@ -242,7 +250,7 @@ def prepare_manifest(
 ) -> dict[str, Any]:
     try:
         source = Path(source_path).resolve(strict=True)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise WorkflowError(f"Cannot resolve source package: {source_path}") from exc
     if not source.is_file():
         raise WorkflowError("source must be a regular JSON file")
@@ -341,7 +349,10 @@ def validate_manifest(manifest_path: str | Path) -> dict[str, Any]:
     if not isinstance(package_root_value, str) or not package_root_value:
         errors.append("package_root must be a non-empty string")
     else:
-        package_root = Path(package_root_value).resolve()
+        try:
+            package_root = Path(package_root_value).resolve()
+        except (OSError, ValueError) as exc:
+            errors.append(f"package_root is invalid: {exc}")
 
     assets = manifest.get("assets")
     if not isinstance(assets, list):
@@ -516,6 +527,8 @@ def verify_approval(
         "manifest_id": manifest.get("manifest_id"),
         "content_hash": manifest.get("content_hash"),
         "approval_id": approval.get("approval_id"),
+        "issued_at": approval.get("issued_at"),
+        "expires_at": approval.get("expires_at"),
         "errors": errors,
     }
 
@@ -563,6 +576,15 @@ def record_publication(
         raise WorkflowError("result published_at must be a UTC timestamp")
     published_time = _parse_utc(published_at)
     normalized_published_at = _format_utc(published_time)
+    now = datetime.now(timezone.utc)
+    if published_time > now + timedelta(minutes=5):
+        raise WorkflowError("result published_at is in the future")
+    approval_issued = _parse_utc(approval_report["issued_at"])
+    approval_expires = _parse_utc(approval_report["expires_at"])
+    if published_time < approval_issued - timedelta(minutes=5):
+        raise WorkflowError("result published_at predates the approval window")
+    if published_time > approval_expires + timedelta(minutes=5):
+        raise WorkflowError("result published_at is after the approval window")
     verification = result.get("verification")
     if not isinstance(verification, dict):
         raise WorkflowError("result verification must be an object")
@@ -579,9 +601,6 @@ def record_publication(
         raise WorkflowError("verification verified_at must be a UTC timestamp")
     verified_time = _parse_utc(verified_at)
     normalized_verified_at = _format_utc(verified_time)
-    now = datetime.now(timezone.utc)
-    if published_time > now + timedelta(minutes=5):
-        raise WorkflowError("result published_at is in the future")
     if verified_time > now + timedelta(minutes=5):
         raise WorkflowError("verification verified_at is in the future")
     if verified_time < published_time - timedelta(minutes=5):
