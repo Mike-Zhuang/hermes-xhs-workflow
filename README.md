@@ -21,12 +21,15 @@ This is on-demand automation, not scheduled autonomous posting. The Skill does n
 - SHA-256 for every image and the canonical publication manifest;
 - two authorization modes: `direct_publish_command` and `explicit_hash_confirmation`;
 - short-lived, manifest-bound approval;
-- private, exclusive attempt record created before the external write;
+- approval expiry is checked again immediately before the external write;
+- a deterministic private attempt record derived from `approval_id` and created before the external write, so changing output paths cannot replay an approval;
+- snapshot/preflight failures occur before attempt reservation and do not consume the approval;
 - no automatic retry after timeout or ambiguous outcome;
 - `reconcile` performs readback only and never calls `post_note`;
-- verified image snapshots are uploaded instead of mutable source paths;
+- verified image bytes are exposed only through inherited unlinked descriptors; Linux snapshots are kernel write-sealed before `post_note`;
 - Cookie and backend payloads stay out of argv, stdout, stderr, Git, and publication records;
-- a separate `XHS_API_PYTHON` can run the third-party backend in an isolated venv;
+- an explicit `XHS_API_PYTHON` must resolve to a verified isolated venv; Hermes's main interpreter is rejected;
+- backend responses are size/depth checked and rejected if they echo the active Cookie or return an unsafe note ID;
 - the general research adapter remains restricted to seven read-only methods.
 
 It does not implement engagement automation, CAPTCHA bypass, anti-bot evasion, proxy rotation, bulk account operation, or unattended cron publishing.
@@ -100,25 +103,27 @@ python3 "$SKILL/scripts/xhs_workflow.py" approve \
 python3 "$SKILL/scripts/xhs_publish_adapter.py" publish \
   --manifest "$PACKAGE/manifest.json" \
   --approval "$PACKAGE/approval.json" \
-  --attempt "$PACKAGE/publish-attempt.json" \
   --record "$PACKAGE/publication.json"
 ```
+
+`manifest.json`, `approval.json`, the publication record, and the deterministic attempt record are exclusive outputs and are never overwritten. The attempt path is derived internally as `.xhs-publish-attempt-<approval-id>.json` directly under the package root; callers cannot choose an alternate path.
 
 The agent runs this sequence after an unambiguous direct command such as “发布这篇到小红书”. It must not ask for a second hash confirmation when the direct command already delegates publication of the current package.
 
 ## Ambiguous outcome and reconciliation
 
-If `publish` returns an error after creating `publish-attempt.json`, do not rerun `publish`. Use read-only reconciliation:
+If `publish` returns an error after creating its deterministic attempt record, do not rerun `publish`. Use read-only reconciliation:
 
 ```bash
 python3 "$SKILL/scripts/xhs_publish_adapter.py" reconcile \
   --manifest "$PACKAGE/manifest.json" \
   --approval "$PACKAGE/approval.json" \
-  --attempt "$PACKAGE/publish-attempt.json" \
   --record "$PACKAGE/publication.json"
 ```
 
-If no note ID was received before the failure, automatic reconciliation cannot safely identify the note. Stop and inspect the creator account; never blindly retry.
+Reconciliation remains available after the approval expires because it is read-only. It still verifies that the original backend acceptance timestamp fell inside the authorization window. If no note ID was received before the failure, automatic reconciliation cannot safely identify the note. Stop and inspect the creator account; never blindly retry.
+
+If a verified publication record was durably created but the final attempt-state update failed, `reconcile` validates that existing record against the manifest, approval, note ID, URL, and timestamps, then repairs the attempt without another backend call.
 
 ## Optional read-only research adapter
 

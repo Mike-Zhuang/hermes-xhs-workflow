@@ -70,9 +70,9 @@ export XHS_COOKIE_FILE="$HOME/.config/xhs-workflow/creator-cookie.txt"
 chmod 600 "$XHS_COOKIE_FILE"
 ```
 
-The Cookie file must be a regular non-symlink UTF-8 file with mode `0600`. It is read internally and injected into a mode-`0600` temporary JSON file; it never enters argv. Backend stdout/stderr are suppressed, and backend error messages are not returned.
+The Cookie file must be a regular non-symlink UTF-8 file with mode `0600`. It is read internally and injected into a mode-`0600` temporary JSON file; it never enters argv. Backend stdout/stderr are suppressed, backend error messages are not returned, and successful responses that echo the active Cookie are rejected before persistence.
 
-Do not install third-party dependencies into Hermes's own Python. Use the isolated `XHS_API_PYTHON` venv. The reviewed XhsSkills commit is documented in `README.md` and `references/backends.md`.
+Do not install third-party dependencies into Hermes's own Python. `XHS_API_PYTHON` is mandatory and must point to an isolated venv launcher; the main Hermes/system interpreter is rejected. The reviewed XhsSkills commit is documented in `README.md` and `references/backends.md`.
 
 ## Package layout
 
@@ -168,16 +168,15 @@ python3 "$XHS_SKILL/scripts/xhs_workflow.py" verify \
 python3 "$XHS_SKILL/scripts/xhs_publish_adapter.py" publish \
   --manifest "$PACKAGE/manifest.json" \
   --approval "$PACKAGE/approval.json" \
-  --attempt "$PACKAGE/publish-attempt.json" \
   --record "$PACKAGE/publication.json"
 ```
 
 The publisher:
 
 1. verifies approval and current asset hashes;
-2. creates private immutable-by-path snapshots of the approved bytes;
-3. atomically creates `publish-attempt.json` before external write;
-4. calls only `creator.post_note` once;
+2. creates anonymous snapshots and exposes only inherited descriptor paths to the backend; Linux snapshots are kernel write-sealed before the child starts;
+3. rechecks approval expiry at the external-write boundary;
+4. atomically creates `.xhs-publish-attempt-<approval-id>.json`, then calls only `creator.post_note` once; the caller cannot select the attempt path;
 5. extracts the returned note ID;
 6. polls only `creator.get_publish_note_info`;
 7. accepts readback only when note ID and title both match;
@@ -187,17 +186,16 @@ Success criterion: exit code `0`, record status `publication_recorded`, and a no
 
 ### 5. Reconcile uncertain outcomes
 
-If `publish-attempt.json` exists and `publish` failed, never call `publish` again with another path. Use:
+If the deterministic attempt record exists and `publish` failed, never call `publish` again. Use:
 
 ```bash
 python3 "$XHS_SKILL/scripts/xhs_publish_adapter.py" reconcile \
   --manifest "$PACKAGE/manifest.json" \
   --approval "$PACKAGE/approval.json" \
-  --attempt "$PACKAGE/publish-attempt.json" \
   --record "$PACKAGE/publication.json"
 ```
 
-`reconcile` invokes only `creator.get_publish_note_info`; it cannot publish. If the attempt contains no note ID or readback cannot find the exact note, stop and report `outcome_unknown`. Do not bypass this by deleting/renaming the attempt or choosing a different attempt path.
+`reconcile` invokes only `creator.get_publish_note_info`; it cannot publish. It may run after approval expiry, but the original backend acceptance timestamp must still fall inside the authorization window. If the attempt contains no note ID or readback cannot find the exact note, stop and report `outcome_unknown`. Do not bypass this by deleting the attempt.
 
 ## Login and risk controls
 

@@ -106,29 +106,75 @@ def _write_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
     temporary.replace(path)
 
 
-def _write_json_exclusive(path: Path, value: Any, *, mode: int = 0o600) -> None:
+def _write_json_exclusive(
+    path: Path,
+    value: Any,
+    *,
+    mode: int = 0o600,
+    label: str = "JSON output",
+) -> None:
     """Create a JSON file atomically without ever replacing an existing path."""
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     except FileExistsError as exc:
-        raise WorkflowError(f"Publication record already exists: {path}") from exc
+        raise WorkflowError(f"{label} already exists: {path}") from exc
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
     except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
         path.unlink(missing_ok=True)
         raise
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_json(path: Path, *, required_mode: int | None = None) -> dict[str, Any]:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    descriptor = -1
     try:
-        if path.stat().st_size > MAX_JSON_BYTES:
+        descriptor = os.open(path, os.O_RDONLY | nofollow | cloexec)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise WorkflowError(f"JSON path is not a regular file: {path}")
+        if required_mode is not None and stat.S_IMODE(before.st_mode) != required_mode:
+            raise WorkflowError(f"JSON file must have mode {required_mode:o}: {path}")
+        if before.st_size > MAX_JSON_BYTES:
             raise WorkflowError(f"JSON file exceeds 1 MiB: {path}")
-        value = json.loads(path.read_text(encoding="utf-8"))
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, min(65536, MAX_JSON_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_JSON_BYTES:
+                raise WorkflowError(f"JSON file exceeds 1 MiB: {path}")
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            raise WorkflowError(f"JSON file changed while being read: {path}")
+        value = json.loads(b"".join(chunks).decode("utf-8"))
     except WorkflowError:
         raise
     except (
@@ -138,7 +184,10 @@ def _load_json(path: Path) -> dict[str, Any]:
         RecursionError,
         ValueError,
     ) as exc:
-        raise WorkflowError(f"Cannot read JSON file {path}: {exc}") from exc
+        raise WorkflowError(f"Cannot securely read JSON file {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not isinstance(value, dict):
         raise WorkflowError(f"Expected a JSON object in {path}")
     return value
@@ -306,12 +355,11 @@ def prepare_manifest(
         "assets": assets,
     }
     manifest["content_hash"] = _canonical_hash(_hash_material(manifest))
-    _write_json(Path(manifest_path), manifest)
+    _write_json_exclusive(Path(manifest_path), manifest, mode=0o600, label="Manifest")
     return manifest
 
 
-def validate_manifest(manifest_path: str | Path) -> dict[str, Any]:
-    manifest = _load_json(Path(manifest_path))
+def _validate_manifest_data(manifest: dict[str, Any]) -> dict[str, Any]:
     errors: list[str] = []
     if manifest.get("schema_version") != SCHEMA_VERSION:
         errors.append("unsupported schema_version")
@@ -411,11 +459,15 @@ def validate_manifest(manifest_path: str | Path) -> dict[str, Any]:
     }
 
 
+def validate_manifest(manifest_path: str | Path) -> dict[str, Any]:
+    return _validate_manifest_data(_load_json(Path(manifest_path)))
+
+
 def build_preview(manifest_path: str | Path) -> dict[str, Any]:
-    report = validate_manifest(manifest_path)
+    manifest = _load_json(Path(manifest_path))
+    report = _validate_manifest_data(manifest)
     if not report["valid"]:
         raise WorkflowError("Cannot preview an invalid manifest")
-    manifest = _load_json(Path(manifest_path))
     post = manifest["post"]
     image_paths = [asset["path"] for asset in manifest["assets"]]
     warnings = []
@@ -455,10 +507,10 @@ def approve_manifest(
         raise WorkflowError("authorization_mode is unsupported")
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 86400:
         raise WorkflowError("ttl_seconds must be between 1 and 86400")
-    report = validate_manifest(manifest_path)
+    manifest = _load_json(Path(manifest_path))
+    report = _validate_manifest_data(manifest)
     if not report["valid"]:
         raise WorkflowError("Cannot approve an invalid manifest")
-    manifest = _load_json(Path(manifest_path))
     if confirmed_content_hash != manifest["content_hash"]:
         raise WorkflowError("confirmed content hash does not match the manifest")
     issued_at = datetime.now(timezone.utc)
@@ -473,33 +525,18 @@ def approve_manifest(
         "issued_at": _format_utc(issued_at),
         "expires_at": _format_utc(issued_at + timedelta(seconds=ttl_seconds)),
     }
-    _write_json(Path(approval_path), approval, mode=0o600)
+    _write_json_exclusive(Path(approval_path), approval, mode=0o600, label="Approval")
     return approval
 
 
-def verify_approval(
-    manifest_path: str | Path, approval_path: str | Path
+def _verify_approval_data(
+    manifest: dict[str, Any],
+    approval: dict[str, Any],
+    *,
+    allow_expired: bool = False,
 ) -> dict[str, Any]:
-    manifest_report = validate_manifest(manifest_path)
-    approval_file = Path(approval_path)
-    manifest = _load_json(Path(manifest_path))
+    manifest_report = _validate_manifest_data(manifest)
     errors = list(manifest_report["errors"])
-    approval: dict[str, Any] = {}
-
-    try:
-        file_stat = approval_file.lstat()
-        unsafe_file = stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(
-            file_stat.st_mode
-        )
-        if unsafe_file:
-            errors.append("approval file must be a regular, non-symlink file")
-        if stat.S_IMODE(file_stat.st_mode) != 0o600:
-            errors.append("approval file must have mode 600")
-        if not unsafe_file:
-            approval = _load_json(approval_file)
-    except (OSError, WorkflowError) as exc:
-        errors.append(f"cannot securely read approval file: {exc}")
-
     if approval.get("schema_version") != SCHEMA_VERSION:
         errors.append("approval schema_version is unsupported")
     try:
@@ -534,7 +571,7 @@ def verify_approval(
             errors.append("approval expires_at must be after issued_at")
         if expires_at - issued_at > timedelta(days=1):
             errors.append("approval lifetime exceeds 24 hours")
-        if now >= expires_at:
+        if not allow_expired and now >= expires_at:
             errors.append("approval expired")
     except (KeyError, WorkflowError) as exc:
         errors.append(str(exc))
@@ -549,19 +586,51 @@ def verify_approval(
     }
 
 
-def record_publication(
+def load_verified_publication_inputs(
     manifest_path: str | Path,
     approval_path: str | Path,
-    result_path: str | Path,
+    *,
+    allow_expired: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    manifest = _load_json(Path(manifest_path))
+    approval = _load_json(Path(approval_path), required_mode=0o600)
+    report = _verify_approval_data(manifest, approval, allow_expired=allow_expired)
+    return manifest, approval, report
+
+
+def verify_approval(
+    manifest_path: str | Path,
+    approval_path: str | Path,
+    *,
+    allow_expired: bool = False,
+) -> dict[str, Any]:
+    try:
+        _, _, report = load_verified_publication_inputs(
+            manifest_path, approval_path, allow_expired=allow_expired
+        )
+        return report
+    except WorkflowError as exc:
+        return {
+            "valid": False,
+            "manifest_id": None,
+            "content_hash": None,
+            "approval_id": None,
+            "issued_at": None,
+            "expires_at": None,
+            "errors": [str(exc)],
+        }
+
+
+def record_publication_data(
+    approval_report: dict[str, Any],
+    result: dict[str, Any],
     record_path: str | Path,
 ) -> dict[str, Any]:
-    approval_report = verify_approval(manifest_path, approval_path)
     if not approval_report["valid"]:
         raise WorkflowError(
             "Cannot record publication with invalid approval: "
             + "; ".join(approval_report["errors"])
         )
-    result = _load_json(Path(result_path))
     _reject_secret_fields(result)
     if result.get("platform") != "xiaohongshu":
         raise WorkflowError("result platform must be 'xiaohongshu'")
@@ -644,6 +713,19 @@ def record_publication(
     destination = Path(record_path)
     _write_json_exclusive(destination, record, mode=0o600)
     return record
+
+
+def record_publication(
+    manifest_path: str | Path,
+    approval_path: str | Path,
+    result_path: str | Path,
+    record_path: str | Path,
+) -> dict[str, Any]:
+    _, _, approval_report = load_verified_publication_inputs(
+        manifest_path, approval_path
+    )
+    result = _load_json(Path(result_path))
+    return record_publication_data(approval_report, result, record_path)
 
 
 def _build_parser() -> argparse.ArgumentParser:

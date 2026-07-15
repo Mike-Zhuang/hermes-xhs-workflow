@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -19,33 +20,43 @@ from typing import Any
 
 try:
     from scripts.xhs_readonly_adapter import (
+        MAX_JSON_DEPTH,
         MAX_RESPONSE_BYTES,
+        SECRET_KEYS,
         AdapterError,
         _load_object,
+        _normalize_secret_key,
         _read_cookie,
     )
     from scripts.xhs_workflow import (
         WorkflowError,
+        _format_utc,
         _load_json,
+        _parse_utc,
         _write_json,
         _write_json_exclusive,
-        record_publication,
-        verify_approval,
+        load_verified_publication_inputs,
+        record_publication_data,
     )
 except ModuleNotFoundError:  # Direct execution through an absolute script path.
     from xhs_readonly_adapter import (  # type: ignore[no-redef]
+        MAX_JSON_DEPTH,
         MAX_RESPONSE_BYTES,
+        SECRET_KEYS,
         AdapterError,
         _load_object,
+        _normalize_secret_key,
         _read_cookie,
     )
     from xhs_workflow import (  # type: ignore[no-redef]
         WorkflowError,
+        _format_utc,
         _load_json,
+        _parse_utc,
         _write_json,
         _write_json_exclusive,
-        record_publication,
-        verify_approval,
+        load_verified_publication_inputs,
+        record_publication_data,
     )
 
 MAX_ASSET_BYTES = 30 * 1024 * 1024
@@ -60,23 +71,79 @@ def _utc_now() -> str:
 
 
 def _resolve_tool(api_tool: str | Path) -> Path:
+    tool = Path(api_tool)
+    if not tool.is_absolute():
+        raise PublishError("XhsSkills api tool path must be absolute")
     try:
-        tool = Path(api_tool).resolve(strict=True)
+        resolved = tool.resolve(strict=True)
+        tool_stat = tool.lstat()
     except (OSError, ValueError) as exc:
         raise PublishError(f"Cannot resolve XhsSkills api tool: {api_tool}") from exc
-    if not tool.is_file():
+    if resolved != tool or stat.S_ISLNK(tool_stat.st_mode):
+        raise PublishError("api tool path must not contain a symlink")
+    if not stat.S_ISREG(tool_stat.st_mode):
         raise PublishError("api tool must be a regular file")
     return tool
 
 
-def _resolve_python(api_python: str | Path) -> Path:
+def _resolve_python(api_python: str | Path | None) -> Path:
+    if api_python is None:
+        raise PublishError(
+            "backend Python must be explicitly configured with XHS_API_PYTHON"
+        )
+    launcher = Path(api_python)
+    if not launcher.is_absolute():
+        raise PublishError("backend Python path must be absolute")
     try:
-        executable = Path(api_python).resolve(strict=True)
+        launcher_stat = launcher.lstat()
+        target = launcher.resolve(strict=True)
+        target_stat = target.stat()
+        venv_root = launcher.parent.parent.resolve(strict=True)
     except (OSError, ValueError) as exc:
         raise PublishError(f"Cannot resolve backend Python: {api_python}") from exc
-    if not executable.is_file() or not os.access(executable, os.X_OK):
-        raise PublishError("backend Python must be an executable regular file")
-    return executable
+    config = venv_root / "pyvenv.cfg"
+    try:
+        config_stat = config.lstat()
+    except OSError as exc:
+        raise PublishError(
+            "backend Python must belong to an isolated virtual environment"
+        ) from exc
+    if not (stat.S_ISREG(launcher_stat.st_mode) or stat.S_ISLNK(launcher_stat.st_mode)):
+        raise PublishError("backend Python launcher must be a regular file or symlink")
+    if not stat.S_ISREG(target_stat.st_mode) or not os.access(target, os.X_OK):
+        raise PublishError("backend Python target must be an executable regular file")
+    if not stat.S_ISREG(config_stat.st_mode) or stat.S_ISLNK(config_stat.st_mode):
+        raise PublishError(
+            "backend Python must belong to an isolated virtual environment"
+        )
+    probe = (
+        "import json,sys;"
+        "print(json.dumps({'prefix':sys.prefix,'base_prefix':sys.base_prefix}))"
+    )
+    try:
+        completed = subprocess.run(  # noqa: S603 -- validated absolute venv launcher
+            [str(launcher), "-I", "-c", probe],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        runtime = json.loads(completed.stdout)
+        runtime_prefix = Path(runtime["prefix"]).resolve(strict=True)
+        base_prefix = Path(runtime["base_prefix"]).resolve(strict=True)
+    except (
+        OSError,
+        KeyError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        raise PublishError("cannot verify isolated backend Python runtime") from exc
+    if runtime_prefix != venv_root or runtime_prefix == base_prefix:
+        raise PublishError(
+            "backend Python must run inside the configured virtual environment"
+        )
+    return launcher
 
 
 def _read_asset(
@@ -156,18 +223,96 @@ def _read_asset(
             os.close(descriptor)
 
 
-def _snapshot_assets(manifest: dict[str, Any], snapshot_root: Path) -> list[str]:
+def _snapshot_assets(
+    manifest: dict[str, Any], snapshot_root: Path
+) -> tuple[list[str], list[int]]:
     package_root = Path(manifest["package_root"]).resolve(strict=True)
+    if Path("/proc/self/fd").is_dir():
+        descriptor_root = "/proc/self/fd"
+    elif Path("/dev/fd").is_dir():
+        descriptor_root = "/dev/fd"
+    else:
+        raise PublishError("platform does not expose inherited descriptor paths")
     paths: list[str] = []
-    for asset in manifest["assets"]:
-        relative = asset["path"]
-        data = _read_asset(package_root, relative, asset)
-        suffix = Path(relative).suffix.lower()
-        destination = snapshot_root / f"{asset['index']:02d}{suffix}"
-        destination.write_bytes(data)
-        os.chmod(destination, 0o600)
-        paths.append(str(destination))
-    return paths
+    descriptors: list[int] = []
+    try:
+        for asset in manifest["assets"]:
+            relative = asset["path"]
+            data = _read_asset(package_root, relative, asset)
+            if all(
+                hasattr(namespace, name)
+                for namespace, name in (
+                    (os, "memfd_create"),
+                    (os, "MFD_ALLOW_SEALING"),
+                    (fcntl, "F_ADD_SEALS"),
+                    (fcntl, "F_SEAL_WRITE"),
+                    (fcntl, "F_SEAL_GROW"),
+                    (fcntl, "F_SEAL_SHRINK"),
+                    (fcntl, "F_SEAL_SEAL"),
+                )
+            ):
+                read_descriptor = os.memfd_create(
+                    "xhs-approved-image",
+                    flags=os.MFD_ALLOW_SEALING | getattr(os, "MFD_CLOEXEC", 0),
+                )
+                try:
+                    view = memoryview(data)
+                    while view:
+                        written = os.write(read_descriptor, view)
+                        if written <= 0:
+                            raise PublishError("cannot write anonymous asset snapshot")
+                        view = view[written:]
+                    os.lseek(read_descriptor, 0, os.SEEK_SET)
+                    seals = (
+                        fcntl.F_SEAL_WRITE
+                        | fcntl.F_SEAL_GROW
+                        | fcntl.F_SEAL_SHRINK
+                        | fcntl.F_SEAL_SEAL
+                    )
+                    fcntl.fcntl(read_descriptor, fcntl.F_ADD_SEALS, seals)
+                except Exception:
+                    os.close(read_descriptor)
+                    raise
+            else:
+                write_descriptor, temporary_name = tempfile.mkstemp(dir=snapshot_root)
+                read_descriptor = -1
+                try:
+                    handle = os.fdopen(write_descriptor, "wb")
+                    write_descriptor = -1
+                    with handle:
+                        handle.write(data)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        os.fchmod(handle.fileno(), 0o400)
+                    read_descriptor = os.open(
+                        temporary_name,
+                        os.O_RDONLY
+                        | getattr(os, "O_NOFOLLOW", 0)
+                        | getattr(os, "O_CLOEXEC", 0),
+                    )
+                    os.unlink(temporary_name)
+                except Exception:
+                    if write_descriptor >= 0:
+                        os.close(write_descriptor)
+                    if read_descriptor >= 0:
+                        os.close(read_descriptor)
+                    try:
+                        os.unlink(temporary_name)
+                    except OSError:
+                        pass
+                    raise
+            descriptors.append(read_descriptor)
+            snapshot_stat = os.fstat(read_descriptor)
+            if not stat.S_ISREG(snapshot_stat.st_mode) or snapshot_stat.st_size != len(
+                data
+            ):
+                raise PublishError("anonymous asset snapshot is invalid")
+            paths.append(f"{descriptor_root}/{read_descriptor}")
+        return paths, descriptors
+    except Exception:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        raise
 
 
 def _call_backend(
@@ -178,6 +323,7 @@ def _call_backend(
     temporary_root: Path,
     *,
     timeout_seconds: int,
+    inherited_descriptors: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     params_path = temporary_root / f"{method}-{uuid.uuid4().hex}.json"
     output_path = temporary_root / f"{method}-{uuid.uuid4().hex}-out.json"
@@ -199,6 +345,7 @@ def _call_backend(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            pass_fds=inherited_descriptors,
             check=False,
             timeout=timeout_seconds,
         )
@@ -232,14 +379,43 @@ def _api_result(response: dict[str, Any], method: str) -> dict[str, Any]:
     return body
 
 
+def _reject_response_secret(
+    value: Any, secret: str, location: str = "$", depth: int = 0
+) -> None:
+    if depth > MAX_JSON_DEPTH:
+        raise PublishError(
+            f"backend response JSON nesting exceeds {MAX_JSON_DEPTH} levels"
+        )
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if _normalize_secret_key(key) in SECRET_KEYS:
+                raise PublishError(
+                    f"backend response contains credential-like field at {location}.{key}"
+                )
+            if isinstance(key, str) and secret and secret in key:
+                raise PublishError(
+                    f"backend response contains credential material at {location}"
+                )
+            _reject_response_secret(child, secret, f"{location}.{key}", depth + 1)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_response_secret(child, secret, f"{location}[{index}]", depth + 1)
+    elif isinstance(value, str) and secret and secret in value:
+        raise PublishError(
+            f"backend response contains credential material at {location}"
+        )
+
+
 def _post_note_id(body: dict[str, Any]) -> str:
     data = body.get("data")
     if not isinstance(data, dict):
         raise PublishError("post response does not contain data")
     note_id = data.get("note_id") or data.get("noteId") or data.get("id")
-    if not isinstance(note_id, str) or not note_id.strip():
+    if not isinstance(note_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{6,128}", note_id.strip()
+    ):
         raise PublishError(
-            "post response does not contain a note ID; outcome is unknown"
+            "post response note_id is missing or unsafe; outcome is unknown"
         )
     return note_id.strip()
 
@@ -272,15 +448,113 @@ def _safe_output_path(path: str | Path, package_root: Path, label: str) -> Path:
     return candidate
 
 
+def _attempt_path(package_root: Path, approval_id: str) -> Path:
+    try:
+        normalized = str(uuid.UUID(approval_id))
+    except (ValueError, AttributeError) as exc:
+        raise PublishError("approval_id is not a valid UUID") from exc
+    return package_root / f".xhs-publish-attempt-{normalized}.json"
+
+
+def _recover_from_existing_record(
+    record_path: Path,
+    attempt_path: Path,
+    attempt: dict[str, Any],
+    approval: dict[str, Any],
+) -> dict[str, Any]:
+    record = _load_json(record_path, required_mode=0o600)
+    _reject_response_secret(record, "")
+    record_fields = {
+        "schema_version",
+        "publication_id",
+        "manifest_id",
+        "content_hash",
+        "approval_id",
+        "status",
+        "platform",
+        "note_id",
+        "url",
+        "published_at",
+        "verification",
+        "recorded_at",
+    }
+    if set(record) != record_fields:
+        raise PublishError("existing publication record has invalid schema fields")
+    verification = record.get("verification")
+    if not isinstance(verification, dict) or set(verification) != {
+        "method",
+        "verified_by",
+        "verified_at",
+    }:
+        raise PublishError(
+            "existing publication record has invalid verification fields"
+        )
+    note_id = attempt["note_id"].strip()
+    expected = {
+        "schema_version": 1,
+        "manifest_id": approval["manifest_id"],
+        "content_hash": approval["content_hash"],
+        "approval_id": approval["approval_id"],
+        "status": "publication_recorded",
+        "platform": "xiaohongshu",
+        "note_id": note_id,
+        "url": f"https://www.xiaohongshu.com/explore/{note_id}",
+        "published_at": attempt["backend_accepted_at"],
+    }
+    if any(record.get(key) != value for key, value in expected.items()):
+        raise PublishError("existing publication record does not match the attempt")
+    try:
+        uuid.UUID(str(record.get("publication_id", "")))
+    except ValueError as exc:
+        raise PublishError("existing publication record has an invalid ID") from exc
+    if (
+        verification.get("method") != "creator_api_readback"
+        or verification.get("verified_by") != "agent"
+    ):
+        raise PublishError("existing publication record has invalid verification")
+    timestamps: dict[str, datetime] = {}
+    for label, value in (
+        ("published_at", record["published_at"]),
+        ("verified_at", verification["verified_at"]),
+        ("recorded_at", record["recorded_at"]),
+    ):
+        if not isinstance(value, str):
+            raise PublishError(
+                f"existing publication record {label} is not a timestamp"
+            )
+        try:
+            parsed = _parse_utc(value)
+        except WorkflowError as exc:
+            raise PublishError(
+                f"existing publication record {label} is not a valid timestamp"
+            ) from exc
+        if _format_utc(parsed) != value:
+            raise PublishError(
+                f"existing publication record {label} is not canonical UTC"
+            )
+        timestamps[label] = parsed
+    now = datetime.now(timezone.utc)
+    if any(value > now for value in timestamps.values()):
+        raise PublishError("existing publication record timestamp is in the future")
+    if timestamps["verified_at"] < timestamps["published_at"]:
+        raise PublishError("existing publication verification predates publication")
+    if timestamps["recorded_at"] < timestamps["verified_at"]:
+        raise PublishError("existing publication record predates verification")
+    attempt["status"] = "verified"
+    attempt["verified_at"] = verification["verified_at"]
+    attempt["publication_id"] = record["publication_id"]
+    _write_json(attempt_path, attempt, mode=0o600)
+    return record
+
+
 def publish_once(
     manifest_path: str | Path,
     approval_path: str | Path,
-    attempt_path: str | Path,
     record_path: str | Path,
     *,
     api_tool: str | Path,
     cookie_file: str | Path,
-    api_python: str | Path = sys.executable,
+    api_python: str | Path | None = None,
     timeout_seconds: int = 300,
     verification_attempts: int = 6,
     verification_delay_seconds: int = 5,
@@ -295,13 +569,13 @@ def publish_once(
         or not 0 <= verification_delay_seconds <= 60
     ):
         raise PublishError("verification_delay_seconds must be an integer from 0 to 60")
-
-    approval = verify_approval(manifest_path, approval_path)
+    manifest, approval_data, approval = load_verified_publication_inputs(
+        manifest_path, approval_path
+    )
     if not approval["valid"]:
         raise PublishError(
             "publication approval is invalid: " + "; ".join(approval["errors"])
         )
-    manifest = _load_json(Path(manifest_path))
     post = manifest["post"]
     if post.get("visibility") != "public":
         raise PublishError(
@@ -311,7 +585,7 @@ def publish_once(
         raise PublishError("automatic publisher requires publish_mode='immediate'")
 
     package_root = Path(manifest["package_root"]).resolve(strict=True)
-    attempt_destination = _safe_output_path(attempt_path, package_root, "attempt file")
+    attempt_destination = _attempt_path(package_root, approval["approval_id"])
     record_destination = _safe_output_path(record_path, package_root, "record file")
     if record_destination.exists() or record_destination.is_symlink():
         raise PublishError("publication record already exists")
@@ -323,7 +597,6 @@ def publish_once(
         temporary_root = Path(temporary)
         snapshot_root = temporary_root / "assets"
         snapshot_root.mkdir(mode=0o700)
-        image_paths = _snapshot_assets(manifest, snapshot_root)
         attempt = {
             "schema_version": 1,
             "attempt_id": str(uuid.uuid4()),
@@ -334,12 +607,7 @@ def publish_once(
             "started_at": _utc_now(),
             "backend": "xhsskills_creator_post_note",
         }
-        try:
-            _write_json_exclusive(attempt_destination, attempt, mode=0o600)
-        except WorkflowError as exc:
-            raise PublishError(
-                "publication attempt already exists; do not retry before reconciliation"
-            ) from exc
+        image_paths, asset_descriptors = _snapshot_assets(manifest, snapshot_root)
         payload = {
             "noteInfo": {
                 "title": post["title"],
@@ -354,25 +622,40 @@ def publish_once(
             "cookies_str": cookie,
         }
         try:
-            post_response = _call_backend(
-                backend_python,
-                tool,
-                "post_note",
-                payload,
-                temporary_root,
-                timeout_seconds=timeout_seconds,
-            )
-            note_id = _post_note_id(_api_result(post_response, "post_note"))
-            attempt["status"] = "backend_accepted"
-            attempt["note_id"] = note_id
-            attempt["backend_accepted_at"] = _utc_now()
-            _write_json(attempt_destination, attempt, mode=0o600)
-        except (PublishError, OSError, WorkflowError) as exc:
-            attempt["status"] = "outcome_unknown"
-            attempt["failed_at"] = _utc_now()
-            attempt["failure"] = type(exc).__name__
-            _write_json(attempt_destination, attempt, mode=0o600)
-            raise
+            if datetime.now(timezone.utc) >= _parse_utc(approval_data["expires_at"]):
+                raise PublishError("publication approval expired before external write")
+            try:
+                _write_json_exclusive(attempt_destination, attempt, mode=0o600)
+            except WorkflowError as exc:
+                raise PublishError(
+                    "publication authorization was already consumed; "
+                    "do not retry before reconciliation"
+                ) from exc
+            try:
+                post_response = _call_backend(
+                    backend_python,
+                    tool,
+                    "post_note",
+                    payload,
+                    temporary_root,
+                    timeout_seconds=timeout_seconds,
+                    inherited_descriptors=tuple(asset_descriptors),
+                )
+                _reject_response_secret(post_response, cookie)
+                note_id = _post_note_id(_api_result(post_response, "post_note"))
+                attempt["status"] = "backend_accepted"
+                attempt["note_id"] = note_id
+                attempt["backend_accepted_at"] = _utc_now()
+                _write_json(attempt_destination, attempt, mode=0o600)
+            except (PublishError, OSError, WorkflowError) as exc:
+                attempt["status"] = "outcome_unknown"
+                attempt["failed_at"] = _utc_now()
+                attempt["failure"] = type(exc).__name__
+                _write_json(attempt_destination, attempt, mode=0o600)
+                raise
+        finally:
+            for descriptor in asset_descriptors:
+                os.close(descriptor)
 
         verified = False
         try:
@@ -385,6 +668,7 @@ def publish_once(
                     temporary_root,
                     timeout_seconds=timeout_seconds,
                 )
+                _reject_response_secret(readback, cookie)
                 body = _api_result(readback, "get_publish_note_info")
                 if _readback_matches(body, note_id, post["title"]):
                     verified = True
@@ -409,25 +693,18 @@ def publish_once(
 
         published_at = attempt["backend_accepted_at"]
         verified_at = _utc_now()
-        result_path = temporary_root / "result.json"
-        _write_json(
-            result_path,
-            {
-                "platform": "xiaohongshu",
-                "note_id": note_id,
-                "url": f"https://www.xiaohongshu.com/explore/{note_id}",
-                "published_at": published_at,
-                "verification": {
-                    "method": "creator_api_readback",
-                    "verified_by": "agent",
-                    "verified_at": verified_at,
-                },
+        result = {
+            "platform": "xiaohongshu",
+            "note_id": note_id,
+            "url": f"https://www.xiaohongshu.com/explore/{note_id}",
+            "published_at": published_at,
+            "verification": {
+                "method": "creator_api_readback",
+                "verified_by": "agent",
+                "verified_at": verified_at,
             },
-            mode=0o600,
-        )
-        record = record_publication(
-            manifest_path, approval_path, result_path, record_destination
-        )
+        }
+        record = record_publication_data(approval, result, record_destination)
         attempt["status"] = "verified"
         attempt["verified_at"] = verified_at
         attempt["publication_id"] = record["publication_id"]
@@ -438,23 +715,23 @@ def publish_once(
 def reconcile_attempt(
     manifest_path: str | Path,
     approval_path: str | Path,
-    attempt_path: str | Path,
     record_path: str | Path,
     *,
     api_tool: str | Path,
     cookie_file: str | Path,
-    api_python: str | Path = sys.executable,
+    api_python: str | Path | None = None,
     timeout_seconds: int = 60,
 ) -> dict[str, Any]:
     """Reconcile an uncertain attempt using read-only creator history; never republish."""
-    approval = verify_approval(manifest_path, approval_path)
+    manifest, _approval_data, approval = load_verified_publication_inputs(
+        manifest_path, approval_path, allow_expired=True
+    )
     if not approval["valid"]:
         raise PublishError(
             "publication approval is invalid: " + "; ".join(approval["errors"])
         )
-    manifest = _load_json(Path(manifest_path))
     package_root = Path(manifest["package_root"]).resolve(strict=True)
-    attempt_source = _safe_output_path(attempt_path, package_root, "attempt file")
+    attempt_source = _attempt_path(package_root, approval["approval_id"])
     record_destination = _safe_output_path(record_path, package_root, "record file")
     try:
         attempt_stat = attempt_source.lstat()
@@ -464,7 +741,7 @@ def reconcile_attempt(
         raise PublishError("attempt file must be a regular, non-symlink file")
     if stat.S_IMODE(attempt_stat.st_mode) != 0o600:
         raise PublishError("attempt file must have mode 600")
-    attempt = _load_json(attempt_source)
+    attempt = _load_json(attempt_source, required_mode=0o600)
     if attempt.get("manifest_id") != manifest["manifest_id"]:
         raise PublishError("attempt manifest_id mismatch")
     if attempt.get("content_hash") != manifest["content_hash"]:
@@ -482,7 +759,9 @@ def reconcile_attempt(
     if not isinstance(published_at, str):
         raise PublishError("attempt has no backend_accepted_at timestamp")
     if record_destination.exists() or record_destination.is_symlink():
-        raise PublishError("publication record already exists")
+        return _recover_from_existing_record(
+            record_destination, attempt_source, attempt, approval
+        )
     if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
         raise PublishError("timeout_seconds must be an integer from 1 to 600")
 
@@ -498,31 +777,25 @@ def reconcile_attempt(
             Path(temporary),
             timeout_seconds=timeout_seconds,
         )
+        _reject_response_secret(readback, cookie)
         body = _api_result(readback, "get_publish_note_info")
         if not _readback_matches(body, note_id.strip(), manifest["post"]["title"]):
             raise PublishError(
                 "note is still absent from creator readback; do not retry publication"
             )
         verified_at = _utc_now()
-        result_path = Path(temporary) / "result.json"
-        _write_json(
-            result_path,
-            {
-                "platform": "xiaohongshu",
-                "note_id": note_id.strip(),
-                "url": f"https://www.xiaohongshu.com/explore/{note_id.strip()}",
-                "published_at": published_at,
-                "verification": {
-                    "method": "creator_api_readback",
-                    "verified_by": "agent",
-                    "verified_at": verified_at,
-                },
+        result = {
+            "platform": "xiaohongshu",
+            "note_id": note_id.strip(),
+            "url": f"https://www.xiaohongshu.com/explore/{note_id.strip()}",
+            "published_at": published_at,
+            "verification": {
+                "method": "creator_api_readback",
+                "verified_by": "agent",
+                "verified_at": verified_at,
             },
-            mode=0o600,
-        )
-        record = record_publication(
-            manifest_path, approval_path, result_path, record_destination
-        )
+        }
+        record = record_publication_data(approval, result, record_destination)
     attempt["status"] = "verified"
     attempt["verified_at"] = verified_at
     attempt["publication_id"] = record["publication_id"]
@@ -533,12 +806,11 @@ def reconcile_attempt(
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--approval", required=True)
-    parser.add_argument("--attempt", required=True)
     parser.add_argument("--record", required=True)
     parser.add_argument("--api-tool", default=os.environ.get("XHS_API_TOOL"))
     parser.add_argument(
         "--api-python",
-        default=os.environ.get("XHS_API_PYTHON", sys.executable),
+        default=os.environ.get("XHS_API_PYTHON"),
         help="Python executable for the isolated XhsSkills environment",
     )
     parser.add_argument("--cookie-file", default=os.environ.get("XHS_COOKIE_FILE"))
@@ -561,10 +833,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    if not args.api_tool or not args.cookie_file:
+    if not args.api_tool or not args.api_python or not args.cookie_file:
         print(
             json.dumps(
-                {"ok": False, "error": "XHS_API_TOOL and XHS_COOKIE_FILE are required"}
+                {
+                    "ok": False,
+                    "error": (
+                        "XHS_API_TOOL, XHS_API_PYTHON, and XHS_COOKIE_FILE are required"
+                    ),
+                }
             )
         )
         return 2
@@ -573,7 +850,6 @@ def main(argv: list[str] | None = None) -> int:
             result = publish_once(
                 args.manifest,
                 args.approval,
-                args.attempt,
                 args.record,
                 api_tool=args.api_tool,
                 api_python=args.api_python,
@@ -586,7 +862,6 @@ def main(argv: list[str] | None = None) -> int:
             result = reconcile_attempt(
                 args.manifest,
                 args.approval,
-                args.attempt,
                 args.record,
                 api_tool=args.api_tool,
                 api_python=args.api_python,

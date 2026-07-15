@@ -12,7 +12,7 @@ Approval and attempt files are workflow evidence, not cryptographic identity cre
 
 `xhs_publish_adapter.py publish` uploads media and attempts to create a public XHS post. Before calling it, the agent must have a direct user publication command or an explicit hash confirmation for the exact current package.
 
-A direct command authorizes one attempt. The publisher creates the attempt file before invoking `creator.post_note`. If a timeout or ambiguous response occurs, the post may already exist. Do not delete, rename, or bypass the attempt file and do not retry `publish`; use the read-only `reconcile` command.
+A direct command authorizes one attempt. Local snapshot/preflight failures happen before reservation. After preflight, the publisher rechecks expiry, derives a fixed attempt path from `approval_id`, and creates it immediately before invoking `creator.post_note`; choosing a different record path cannot replay the approval. If a timeout or ambiguous response occurs, the post may already exist. Do not delete or bypass the attempt file and do not retry `publish`; use the read-only `reconcile` command. If record creation succeeded but final attempt persistence failed, reconciliation strictly validates the existing record and repairs the attempt without another backend call.
 
 ## Credential rules
 
@@ -22,7 +22,7 @@ A direct command authorizes one attempt. The publisher creates the attempt file 
 - Keep the third-party backend in a separate pinned directory and venv selected by `XHS_API_PYTHON`.
 - Revoke or rotate any credential that may have been exposed.
 
-The adapter suppresses third-party stdout/stderr and does not return upstream error messages because they may contain credentials. Cookie-bearing parameter files and verified media snapshots live in a private temporary directory and are removed after the call.
+The adapter suppresses third-party stdout/stderr and does not return upstream error messages because they may contain credentials. Cookie-bearing parameter files live in a private temporary directory. Verified media bytes are exposed only through inherited, unlinked descriptors during `post_note`; Linux uses kernel write seals, while the macOS fallback uses an unlinked mode-`0400` inode opened read-only. Successful responses are rejected if any nested string contains the active Cookie.
 
 ## Threat model
 
@@ -36,15 +36,15 @@ In scope:
 - accidental duplicate publication after timeout or readback failure;
 - arbitrary method dispatch through either adapter;
 - shell injection through backend invocation;
-- accidental attempt/publication-record overwrite;
-- Cookie exposure through argv, backend stdout/stderr, or backend error messages;
+- accidental manifest, approval, attempt, or publication-record overwrite;
+- Cookie exposure through argv, backend stdout/stderr, backend error messages, or successful response fields;
 - malformed, oversized, or deeply nested JSON responses;
 - running the third-party backend in a separate Python environment.
 
 Out of scope:
 
 - a malicious process running as the same OS user or with write access to package, approval, attempt, backend, or credential files;
-- a caller deliberately bypassing one-attempt semantics by deleting artifacts or selecting alternate package/output paths;
+- a caller deliberately deleting or forging artifacts with the same OS-user permissions;
 - transformed, encoded, fragmented, or newly generated credentials hidden under arbitrary benign backend fields;
 - malicious or compromised code in the separately installed XhsSkills runtime or its dependencies;
 - compromise of the host, XHS account, browser profile, or upstream supply chain;

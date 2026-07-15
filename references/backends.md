@@ -37,16 +37,19 @@ Controls in this repository:
 - only `creator.post_note` is exposed as an external write;
 - only image posts with immediate public visibility are accepted;
 - a current manifest-bound approval is mandatory;
+- approval expiry is checked again immediately before `creator.post_note`;
 - `authorization_mode` distinguishes a direct publish command from explicit hash confirmation;
-- source images are securely reopened, rehashed, copied to private snapshots, and uploaded from those snapshots;
-- an exclusive attempt file is created before the write call;
+- source images are securely reopened and rehashed, copied into unlinked descriptors, and exposed to the child only through inherited descriptor paths; Linux adds kernel write seals before execution;
+- after snapshots and the final expiry check, a fixed exclusive attempt path is derived from `approval_id` immediately before the write call, so alternate record paths cannot replay authorization;
 - the write call is never automatically repeated;
 - verification uses only `creator.get_publish_note_info` and requires exact note-ID/title match;
 - `reconcile` cannot invoke `post_note`;
+- `reconcile` can repair an attempt from a strictly matching existing publication record without calling the backend;
 - Cookie-bearing params use private temporary files, not argv;
 - backend stdout/stderr and upstream message strings are not returned;
-- `XHS_API_PYTHON` keeps upstream Python packages out of the Hermes runtime;
-- request/response sizes and JSON structure are bounded by the adapters.
+- successful responses that echo the active Cookie or return unsafe note IDs are rejected before persistence;
+- mandatory `XHS_API_PYTHON` is probed to confirm a separate venv while preserving the venv launcher path;
+- request/response sizes and JSON depth are bounded by the adapters.
 
 These controls reduce accidental publication, duplication, and disclosure. They do not make unofficial access stable, officially authorized, or safe from platform enforcement.
 
