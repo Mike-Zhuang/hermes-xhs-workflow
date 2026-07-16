@@ -1,11 +1,14 @@
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
+from scripts import xhs_workflow as workflow_module
 from scripts.xhs_workflow import (
     approve_manifest,
     build_preview,
@@ -25,6 +28,65 @@ def utc_minutes_ago(minutes: int) -> str:
 
 
 class XHSWorkflowTests(unittest.TestCase):
+    def test_exclusive_output_fdopen_failure_does_not_leak_descriptor(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("descriptor accounting is unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "exclusive.json"
+            descriptors_before = len(os.listdir("/proc/self/fd"))
+
+            with (
+                patch.object(
+                    workflow_module.os,
+                    "fdopen",
+                    side_effect=OSError("injected exclusive fdopen failure"),
+                ),
+                self.assertRaisesRegex(OSError, "exclusive fdopen failure"),
+            ):
+                workflow_module._write_json_exclusive(destination, {"ok": True})
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors_before)
+
+    def test_manifest_and_approval_outputs_cannot_be_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "01.png").write_bytes(PNG_HEADER + b"exclusive-output")
+            source = root / "post.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "title": "不可覆盖",
+                        "content": "TL;DR：输出必须独占创建。",
+                        "images": ["01.png"],
+                        "publish_mode": "immediate",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            manifest = root / "manifest.json"
+            manifest.write_text("manifest-sentinel", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "exists|already"):
+                prepare_manifest(source, manifest)
+            self.assertEqual(manifest.read_text(encoding="utf-8"), "manifest-sentinel")
+
+            manifest.unlink()
+            prepared = prepare_manifest(source, manifest)
+            approval = root / "approval.json"
+            approval.write_text("approval-sentinel", encoding="utf-8")
+            approval.chmod(0o600)
+
+            with self.assertRaisesRegex(ValueError, "exists|already"):
+                approve_manifest(
+                    manifest,
+                    approval,
+                    confirmed_by="user",
+                    confirmed_content_hash=prepared["content_hash"],
+                )
+            self.assertEqual(approval.read_text(encoding="utf-8"), "approval-sentinel")
+
     def test_prepare_creates_valid_manifest_with_content_and_image_hashes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -56,6 +118,38 @@ class XHSWorkflowTests(unittest.TestCase):
             self.assertEqual(len(manifest["content_hash"]), 64)
             self.assertTrue(report["valid"])
             self.assertEqual(report["content_hash"], manifest["content_hash"])
+
+    def test_direct_publish_command_is_recorded_as_authorization_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "01.png").write_bytes(PNG_HEADER + b"direct-command")
+            source = root / "post.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "title": "直接发布",
+                        "content": "TL;DR：用户指令本身构成一次授权。",
+                        "images": ["01.png"],
+                        "publish_mode": "immediate",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            manifest = root / "manifest.json"
+            approval = root / "approval.json"
+            prepared = prepare_manifest(source, manifest)
+
+            approved = approve_manifest(
+                manifest,
+                approval,
+                confirmed_by="user",
+                confirmed_content_hash=prepared["content_hash"],
+                authorization_mode="direct_publish_command",
+            )
+
+            self.assertEqual(approved["authorization_mode"], "direct_publish_command")
+            self.assertTrue(verify_approval(manifest, approval)["valid"])
 
     def test_malformed_manifest_reports_invalid_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as tmp:
