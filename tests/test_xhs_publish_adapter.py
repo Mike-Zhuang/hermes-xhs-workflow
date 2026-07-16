@@ -626,6 +626,16 @@ Path(__file__).with_name('reconcile-method.txt').write_text(a.method, encoding='
 
             self.assertFalse(self._attempt(root, approval).exists())
 
+    def test_noncanonical_api_tool_path_has_accurate_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "child").mkdir()
+            tool = self._fake_tool(root)
+            noncanonical = root / "child" / ".." / tool.name
+
+            with self.assertRaisesRegex(ValueError, "canonical"):
+                publisher_module._resolve_tool(noncanonical)
+
     def test_backend_python_must_be_explicitly_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

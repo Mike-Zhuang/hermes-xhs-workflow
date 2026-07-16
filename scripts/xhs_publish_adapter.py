@@ -79,6 +79,8 @@ def _resolve_tool(api_tool: str | Path) -> Path:
         tool_stat = tool.lstat()
     except (OSError, ValueError) as exc:
         raise PublishError(f"Cannot resolve XhsSkills api tool: {api_tool}") from exc
+    if Path(os.path.abspath(tool)) != tool:
+        raise PublishError("api tool path must be fully canonical")
     if resolved != tool or stat.S_ISLNK(tool_stat.st_mode):
         raise PublishError("api tool path must not contain a symlink")
     if not stat.S_ISREG(tool_stat.st_mode):
